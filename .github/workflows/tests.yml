@@ -1,0 +1,39 @@
+name: tests
+
+# Opt-in per repository. The job below is gated on the BLUTTER_CI variable,
+# which lives in repository settings rather than in the tree: it is not
+# inherited by forks and does not travel through a merge. Anywhere that has not
+# set it, this reports as skipped rather than failed, so nobody inherits a red
+# tick — and anyone who does want a run can trigger one by hand.
+#
+#   gh variable set BLUTTER_CI --body true
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    if: vars.BLUTTER_CI == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # blutter.py and extract_dart_info.py import these; without them the
+      # tests that exercise them would skip, which BLUTTER_TESTS_STRICT below
+      # turns into a failure rather than a quiet pass.
+      - name: Install dependencies
+        run: pip install requests pyelftools
+
+      # Roughly 28 of the 37 tests run here. The rest need a built Blutter
+      # binary or a sample application — a Dart VM build and a 180 MB download
+      # are not worth doing on every push, so those skip.
+      - name: Run tests
+        env:
+          BLUTTER_TESTS_STRICT: '1'
+        run: python -m unittest discover -s tests -v
