@@ -441,6 +441,7 @@ struct ArrayOp {
 		TypedUnknown,
 		TypedSigned,
 		TypedUnsigned,
+		String, // OneByteString or TwoByteString, whose payload starts before a TypedData's
 		Unknown, // might be Object, List, or TypedUnknown
 	};
 	uint8_t size;
@@ -465,6 +466,7 @@ struct ArrayOp {
 		case TypedUnknown: return std::format("TypeUnknown_{}", size);
 		case TypedSigned: return std::format("TypedSigned_{}", size);
 		case TypedUnsigned: return std::format("TypedUnsigned_{}", size);
+		case String: return std::format("String_{}", size);
 		case Unknown: return std::format("Unknown_{}", size);
 		default: return "";
 		}

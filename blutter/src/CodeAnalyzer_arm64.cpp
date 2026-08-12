@@ -344,6 +344,7 @@ public:
 	std::unique_ptr<AllocateObjectInstr> processTryAllocateObject(AsmIterator& insn);
 	std::unique_ptr<WriteBarrierInstr> processWriteBarrierInstr(AsmIterator& insn);
 	std::unique_ptr<ILInstr> processLoadStore(AsmIterator& insn);
+	intptr_t guardedClassId(AsmIterator& insn, uint64_t accessAddr, A64::Register objReg);
 
 	struct ObjectPoolInstr {
 		// dstReg is srcReg when isWrite is true
@@ -3430,6 +3431,13 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	// 0x17, i.e. the uncompressed answer, so on a compressed build no access
 	// ever matched and every List element fell through to Unknown.
 	const bool isListData = arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag;
+	// A compressed build puts an Array's data and a String's at the same offset,
+	// so that offset alone cannot say which is being read. The width can: a List
+	// element is a tagged pointer, so a one or two byte read from there is a
+	// character, never an element. Where the two offsets differ this is simply
+	// the String answer.
+	const bool isStringData = arr_data_offset == dart::OneByteString::data_offset() - dart::kHeapObjectTag
+		|| arr_data_offset == dart::TwoByteString::data_offset() - dart::kHeapObjectTag;
 	switch (insn.id()) {
 	case ARM64_INS_LDUR: {
 		// for 64 bit integer, LDUR is used too
@@ -3441,11 +3449,11 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	case ARM64_INS_LDURSW:
 		return ArrayOp(4, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRB:
-		return ArrayOp(1, true, isListData ? ArrayOp::List : ArrayOp::TypedUnsigned);
+		return ArrayOp(1, true, isStringData ? ArrayOp::String : ArrayOp::TypedUnsigned);
 	case ARM64_INS_LDRSB:
 		return ArrayOp(1, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRH:
-		return ArrayOp(2, true, ArrayOp::TypedUnsigned);
+		return ArrayOp(2, true, isStringData ? ArrayOp::String : ArrayOp::TypedUnsigned);
 	case ARM64_INS_LDURSH:
 		return ArrayOp(2, true, ArrayOp::TypedSigned);
 	case ARM64_INS_STUR: {
@@ -3455,12 +3463,143 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 		//return ArrayOp(regSize, false, ArrayOp::TypedUnknown);
 	}
 	case ARM64_INS_STRB:
-		return ArrayOp(1, false, ArrayOp::TypedUnknown);
+		return ArrayOp(1, false, isStringData ? ArrayOp::String : ArrayOp::TypedUnknown);
 	case ARM64_INS_STURH:
 		// no signed/unsigned info
-		return ArrayOp(2, false, ArrayOp::TypedUnknown);
+		return ArrayOp(2, false, isStringData ? ArrayOp::String : ArrayOp::TypedUnknown);
 	}
 	return ArrayOp();
+}
+
+// The class id the code has just proved an object to have, when the access at
+// accessAddr sits under a test of it. Dart guards a character read with the
+// class it expects:
+//
+//     r2 = LoadClassIdInstr(r3)
+//     cmp  w2, #0xbc          ; Smi(kOneByteStringCid)
+//     b.ne #0x1724e88
+//     ldrb w5, [x3, #0x10]    ; r3 is a OneByteString here, whatever 0x10 alone says
+//
+// This is the type information a displacement cannot carry: where a String and a
+// TypedData payload overlap, the displacement is the same either way and only the
+// class the code tested says which is being read.
+//
+// Only the equal side of such a test proves anything, so only a b.ne is read, and
+// only for the instruction it skips straight into — a guard says nothing about a
+// register some later instruction may have reassigned. The compared register is
+// followed back to the class id load it came from, through the spill to the frame
+// and the moves the compiler puts between the two, and the answer counts only if
+// the class id loaded was of this access's own base register.
+//
+// Returns dart::kIllegalCid when nothing here says.
+intptr_t FunctionAnalyzer::guardedClassId(AsmIterator& insn, uint64_t accessAddr, A64::Register objReg)
+{
+	const uint64_t firstAddr = asm_insns.FirstPtr()->address;
+	if (accessAddr < firstAddr + 2 * 4)
+		return dart::kIllegalCid;
+
+	AsmIterator it(insn, accessAddr);
+
+	--it;
+	// The access must be what the branch skips into, and the branch must be the
+	// one that skips it when the class is not the tested one.
+	if (!it.IsBranch(ARM64_CC_NE) || it.ops(0).imm <= (int64_t)accessAddr)
+		return dart::kIllegalCid;
+
+	--it;
+	if (it.id() != ARM64_INS_CMP || it.ops(1).type != ARM64_OP_IMM)
+		return dart::kIllegalCid;
+	auto cidReg = ToCapstoneReg(it.ops(0).reg);
+	const int64_t cmpImm = it.ops(1).imm;
+
+	// Follow the compared value back to where the class id was loaded. A class id
+	// is Smi tagged before it is compared against a Smi tagged constant, so the
+	// shift decides how the constant is read back.
+	bool tagged = false;
+	int frameSlot = 0;
+	bool wantSpill = false;
+	// An instruction whose first operand is a register it does not write. Reading
+	// one of these over the object register says nothing about the object.
+	const auto writesFirstOperand = [](const AsmIterator& i) {
+		switch (i.id()) {
+		case ARM64_INS_CMP: case ARM64_INS_CMN: case ARM64_INS_TST:
+		case ARM64_INS_STR: case ARM64_INS_STUR: case ARM64_INS_STRB: case ARM64_INS_STURB:
+		case ARM64_INS_STRH: case ARM64_INS_STURH: case ARM64_INS_STP:
+		case ARM64_INS_B: case ARM64_INS_BL: case ARM64_INS_BR: case ARM64_INS_BLR:
+		case ARM64_INS_CBZ: case ARM64_INS_CBNZ: case ARM64_INS_TBZ: case ARM64_INS_TBNZ:
+			return false;
+		}
+		return true;
+	};
+
+	for (int step = 0; step < 64 && it.address() > firstAddr; ++step) {
+		--it;
+
+		// The class of an object says nothing about whatever a later instruction
+		// put in the register since. Anything that writes the base register
+		// between the test and the access ends the trail.
+		if (it.op_count() >= 1 && it.ops(0).type == ARM64_OP_REG
+			&& A64::Register{ it.ops(0).reg } == objReg && writesFirstOperand(it))
+		{
+			return dart::kIllegalCid;
+		}
+
+		if (wantSpill) {
+			// Looking for what filled the frame slot the value was reloaded from.
+			if ((it.id() == ARM64_INS_STUR || it.id() == ARM64_INS_STR) && !it.writeback()
+				&& it.ops(1).mem.base == CSREG_DART_FP && it.ops(1).mem.disp == frameSlot)
+			{
+				cidReg = ToCapstoneReg(it.ops(0).reg);
+				wantSpill = false;
+			}
+			continue;
+		}
+
+		// Only instructions that define the register being followed matter.
+		if (it.op_count() < 2 || ToCapstoneReg(it.ops(0).reg) != cidReg)
+			continue;
+
+		if (it.id() == ARM64_INS_LSL && ToCapstoneReg(it.ops(1).reg) == cidReg && it.ops(2).imm == dart::kSmiTagSize) {
+			tagged = true;
+			continue;
+		}
+
+		if (it.id() == ARM64_INS_MOV && it.ops(1).type == ARM64_OP_REG) {
+			cidReg = ToCapstoneReg(it.ops(1).reg);
+			continue;
+		}
+
+		if ((it.id() == ARM64_INS_LDUR || it.id() == ARM64_INS_LDR) && !it.writeback()
+			&& it.ops(1).mem.base == CSREG_DART_FP)
+		{
+			frameSlot = it.ops(1).mem.disp;
+			wantSpill = true;
+			continue;
+		}
+
+		// The class id load itself, in either of the two shapes the analyzer knows.
+		// Only a load of *this* access's object says anything about it.
+		if (it.id() == ARM64_INS_UBFX && it.ops(2).imm == kUntaggedObjectClassIdTagPos
+			&& it.ops(3).imm == dart::UntaggedObject::kClassIdTagSize && ToCapstoneReg(it.ops(1).reg) == cidReg)
+		{
+			--it;
+			if (it.id() != ARM64_INS_LDUR || it.ops(1).mem.disp != -1 || ToCapstoneReg(it.ops(0).reg) != cidReg)
+				return dart::kIllegalCid;
+			if (A64::Register{ it.ops(1).mem.base } != objReg)
+				return dart::kIllegalCid;
+			return tagged ? (intptr_t)(cmpImm >> dart::kSmiTagSize) : (intptr_t)cmpImm;
+		}
+		if (it.id() == ARM64_INS_LDURH && it.ops(1).mem.disp == 1 && kUntaggedObjectClassIdTagPos == 16) {
+			if (A64::Register{ it.ops(1).mem.base } != objReg)
+				return dart::kIllegalCid;
+			return tagged ? (intptr_t)(cmpImm >> dart::kSmiTagSize) : (intptr_t)cmpImm;
+		}
+
+		// Written by something else: the trail ends without an answer.
+		return dart::kIllegalCid;
+	}
+
+	return dart::kIllegalCid;
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
@@ -3637,6 +3776,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 			const auto valReg = A64::Register{ insn.ops(0).reg };
 			const auto objReg = A64::Register{ insn.ops(1).mem.base };
 			const auto offset = insn.ops(1).mem.disp;
+			const auto accessAddr = insn.address();
 			++insn;
 
 			if (arrayOp.arrType == ArrayOp::Unknown) {
@@ -3664,22 +3804,85 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 				// array
 				// The index is relative to where the payload starts, and that
 				// differs by array kind: an Array (List) has a type_arguments
-				// field ahead of its data, TypedData does not. Computing a List
-				// index off the TypedData base yields negative indices.
-				const int32_t payload_offset = arrayOp.arrType == ArrayOp::List
-					? (int32_t)(dart::Array::data_offset() - dart::kHeapObjectTag)
-					: (int32_t)(dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag);
-				const auto idx = VarStorage::NewSmallImm((offset - payload_offset) / arrayOp.size);
-				if (arrayOp.isLoad) {
-					return std::make_unique<LoadArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+				// field ahead of its data, TypedData does not, and a String's
+				// characters start before either. Computing an index off the
+				// wrong base yields a negative one, which no element access has.
+				const int32_t arrayPayload = (int32_t)(dart::Array::data_offset() - dart::kHeapObjectTag);
+				const int32_t typedPayload = (int32_t)(dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag);
+				// OneByteString and TwoByteString share it; the element size
+				// says which of the two this is.
+				const int32_t stringPayload = (int32_t)(dart::OneByteString::data_offset() - dart::kHeapObjectTag);
+
+				// TypedDataBase::data_ points at the payload itself, so a register
+				// loaded from that field is already at element zero.
+				bool objRegIsPayload = false;
+				if (!fnInfo->il_insns.empty() && fnInfo->LastIL()->Kind() == ILInstr::LoadField) {
+					const auto il_lf = reinterpret_cast<LoadFieldInstr*>(fnInfo->LastIL());
+					objRegIsPayload = il_lf->dstReg == objReg
+						&& il_lf->offset == (uint32_t)(dart::PointerBase::data_offset() - dart::kHeapObjectTag);
+				}
+
+				auto op = arrayOp;
+				int32_t payload_offset;
+				// What the code itself proved about this object outranks anything
+				// the displacement suggests, and is the only thing that can tell a
+				// String read from a TypedData one where their payloads overlap.
+				const auto guardedCid = guardedClassId(insn, accessAddr, objReg);
+				if (guardedCid == dart::kOneByteStringCid || guardedCid == dart::kTwoByteStringCid) {
+					payload_offset = stringPayload;
+					op.arrType = ArrayOp::String;
+				}
+				else if (guardedCid == dart::kArrayCid || guardedCid == dart::kImmutableArrayCid) {
+					payload_offset = arrayPayload;
+					op.arrType = ArrayOp::List;
+				}
+				else if (guardedCid != dart::kIllegalCid && dart::IsTypedDataClassId(guardedCid)) {
+					payload_offset = typedPayload;
+				}
+				else if (op.arrType == ArrayOp::List) {
+					payload_offset = arrayPayload;
+				}
+				else if (objRegIsPayload) {
+					payload_offset = 0;
+				}
+				else if (offset >= typedPayload) {
+					payload_offset = typedPayload;
+				}
+				else if (offset >= stringPayload && op.size <= 2) {
+					// Below the TypedData payload, so this cannot be indexing one:
+					// its element zero lives at typedPayload and an index never
+					// runs backwards. A character read is the access of this shape
+					// that reads from there.
+					payload_offset = stringPayload;
+					op.arrType = ArrayOp::String;
+				}
+				else if (offset < 0) {
+					// Not a Dart object access at all — no field or element of one
+					// lives before its header. FFI trampolines read their arguments
+					// this way. Leave the instruction as it is rather than describe
+					// it wrongly.
+					return nullptr;
+				}
+				else {
+					// Below every payload base, so nothing here says which array
+					// this indexes, if any. Report the read that is actually there
+					// rather than invent an element for it.
+					if (op.isLoad)
+						return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+					return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+				}
+
+				const auto idx = VarStorage::NewSmallImm((offset - payload_offset) / op.size);
+				if (op.isLoad) {
+					return std::make_unique<LoadArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 				}
 				else {
 					const auto il_wb = processWriteBarrierInstr(insn);
 					if (il_wb) {
-						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 					}
 					else {
-						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 					}
 				}
 			}
