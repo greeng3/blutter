@@ -719,9 +719,23 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 		INSN_ASSERT(GetThreadLeafFunction(thr_offset));
 
 		std::vector<std::unique_ptr<MoveRegInstr>> movILs;
+		bool anyMove = false;
 		while (true) {
 			auto il = processMoveRegInstr(insn);
+			if (!il && !anyMove) {
+				// Never a leaf runtime call: an entry point is also loaded to be
+				// *passed* to the safepoint trampoline, which is what gets called.
+				//   ldr x10, [THR, #0x268]  ; call_native_through_safepoint_entry_point
+				//   ldr x9, [THR, #0x7e8]   ; PropagateError, the entry it dispatches to
+				//   blr x10
+				// Matching on the second load, the register moves that set up a
+				// real call are simply not there. Decline rather than report a
+				// gap; the analyzer leaves this shape as plain instructions
+				// where the trampoline is called with no entry point beside it.
+				return nullptr;
+			}
 			INSN_ASSERT(il);
+			anyMove = true;
 			if (il->srcReg == A64::Register::FP) {
 				INSN_ASSERT(il->dstReg == A64::Register::TMP2);
 				break;
@@ -1666,19 +1680,34 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 		//objPoolInstr.item.Get<VarTypeArgument>();
 		fnInfo->State()->ClearRegister(objPoolInstr.dstReg);
 
-		INSN_ASSERT(insn.IsBranch());
-		const auto contAddr = insn.ops(0).imm;
-		++insn;
+		if (insn.address() == elseAddr) {
+			// The pool load wrote the register the else arm would have moved
+			// into, so the compiler needs neither arm's extra instruction: the
+			// cbnz jumps straight to the merge point and the pool load falls
+			// into it, leaving no branch here and no move there.
+			//   mov  x1, x2           ; typeArg, already in the final register
+			//   cbnz x0, #0x110f0f0   ; typeArgLen != 0 -> keep it
+			//   add  x1, x27, #0xcd, lsl #12
+			//   ldr  x1, [x1, #0x8b8] ; else typeArg_final = from_PP
+			//   ...                   ; 0x110f0f0, the merge point
+			INSN_ASSERT(objPoolInstr.dstReg == A64::Register{ typeArgReg });
+			fnInfo->typeArgumentReg = objPoolInstr.dstReg;
+		}
+		else {
+			INSN_ASSERT(insn.IsBranch());
+			const auto contAddr = insn.ops(0).imm;
+			++insn;
 
-		INSN_ASSERT(elseAddr == insn.address());
-		INSN_ASSERT(insn.id() == ARM64_INS_MOV);
-		INSN_ASSERT(insn.ops(1).reg == typeArgReg);
-		const auto finalTypeArgReg = A64::Register{ insn.ops(0).reg };
-		INSN_ASSERT(finalTypeArgReg == objPoolInstr.dstReg);
-		++insn;
+			INSN_ASSERT(elseAddr == insn.address());
+			INSN_ASSERT(insn.id() == ARM64_INS_MOV);
+			INSN_ASSERT(insn.ops(1).reg == typeArgReg);
+			const auto finalTypeArgReg = A64::Register{ insn.ops(0).reg };
+			INSN_ASSERT(finalTypeArgReg == objPoolInstr.dstReg);
+			++insn;
 
-		INSN_ASSERT(contAddr == insn.address());
-		fnInfo->typeArgumentReg = finalTypeArgReg;
+			INSN_ASSERT(contAddr == insn.address());
+			fnInfo->typeArgumentReg = finalTypeArgReg;
+		}
 	}
 
 	// as of now, track only function parameters, so clear the type argument register as if it is freed
