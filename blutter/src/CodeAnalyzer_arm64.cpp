@@ -3402,6 +3402,13 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	// 0x17, i.e. the uncompressed answer, so on a compressed build no access
 	// ever matched and every List element fell through to Unknown.
 	const bool isListData = arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag;
+	// A compressed build puts an Array's data and a String's at the same offset,
+	// so that offset alone cannot say which is being read. The width can: a List
+	// element is a tagged pointer, so a one or two byte read from there is a
+	// character, never an element. Where the two offsets differ this is simply
+	// the String answer.
+	const bool isStringData = arr_data_offset == dart::OneByteString::data_offset() - dart::kHeapObjectTag
+		|| arr_data_offset == dart::TwoByteString::data_offset() - dart::kHeapObjectTag;
 	switch (insn.id()) {
 	case ARM64_INS_LDUR: {
 		// for 64 bit integer, LDUR is used too
@@ -3413,11 +3420,11 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	case ARM64_INS_LDURSW:
 		return ArrayOp(4, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRB:
-		return ArrayOp(1, true, isListData ? ArrayOp::List : ArrayOp::TypedUnsigned);
+		return ArrayOp(1, true, isStringData ? ArrayOp::String : ArrayOp::TypedUnsigned);
 	case ARM64_INS_LDRSB:
 		return ArrayOp(1, true, ArrayOp::TypedSigned);
 	case ARM64_INS_LDRH:
-		return ArrayOp(2, true, ArrayOp::TypedUnsigned);
+		return ArrayOp(2, true, isStringData ? ArrayOp::String : ArrayOp::TypedUnsigned);
 	case ARM64_INS_LDURSH:
 		return ArrayOp(2, true, ArrayOp::TypedSigned);
 	case ARM64_INS_STUR: {
@@ -3427,10 +3434,10 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 		//return ArrayOp(regSize, false, ArrayOp::TypedUnknown);
 	}
 	case ARM64_INS_STRB:
-		return ArrayOp(1, false, ArrayOp::TypedUnknown);
+		return ArrayOp(1, false, isStringData ? ArrayOp::String : ArrayOp::TypedUnknown);
 	case ARM64_INS_STURH:
 		// no signed/unsigned info
-		return ArrayOp(2, false, ArrayOp::TypedUnknown);
+		return ArrayOp(2, false, isStringData ? ArrayOp::String : ArrayOp::TypedUnknown);
 	}
 	return ArrayOp();
 }

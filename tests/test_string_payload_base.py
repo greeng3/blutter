@@ -43,7 +43,7 @@ BLUTTER_BIN = os.environ.get("BLUTTER_BIN")
 SAMPLE = os.environ.get("BLUTTER_TEST_LIBAPP")
 
 # // 0x1724e78: ArrayLoad: r5 = r3[-7]  ; TypedUnsigned_1
-ARRAY_OP_INDEX = re.compile(r"Array(?:Load|Store): [^;]*\[(-?\d+)\][^;]*;\s(\w+)_\d+")
+ARRAY_OP_INDEX = re.compile(r"Array(?:Load|Store): [^;]*\[(-?\d+)\][^;]*;\s(\w+)_(\d+)")
 
 
 def _requirements_met() -> bool:
@@ -74,12 +74,14 @@ class PayloadBaseTests(unittest.TestCase):
         if result.returncode != 0:
             raise unittest.SkipTest(f"analysis failed: {result.stderr[-2000:]}")
 
-        cls.indices: list[tuple[int, str, str]] = []
+        cls.indices: list[tuple[int, str, int, str]] = []
         for path in (outdir / "asm").rglob("*.dart"):
             for line in path.read_text(errors="replace").splitlines():
                 m = ARRAY_OP_INDEX.search(line)
                 if m:
-                    cls.indices.append((int(m.group(1)), m.group(2), line.strip()))
+                    cls.indices.append(
+                        (int(m.group(1)), m.group(2), int(m.group(3)), line.strip())
+                    )
 
     @classmethod
     def tearDownClass(cls):
@@ -90,11 +92,28 @@ class PayloadBaseTests(unittest.TestCase):
         self.assertTrue(self.indices, "no array access in the whole analysis")
 
     def test_no_array_access_has_a_negative_index(self):
-        negative = [line for index, _, line in self.indices if index < 0]
+        negative = [line for index, _, _, line in self.indices if index < 0]
         self.assertEqual(
             negative,
             [],
             f"{len(negative)} element accesses indexed from the wrong payload base",
+        )
+
+    def test_no_list_element_is_read_a_byte_at_a_time(self):
+        """The other half of the same defect, in terms that need no offset either.
+
+        A List element is a tagged pointer, four or eight bytes wide depending on
+        the build, so a one byte List element does not exist. On a compressed
+        build an Array and a String have the same data offset, so a character
+        read landed on the Array answer and came out List_1 — right index, wrong
+        kind, and no displacement can tell the two apart. What the code tested
+        the object for can.
+        """
+        undersized = [line for _, kind, size, line in self.indices if kind == "List" and size < 4]
+        self.assertEqual(
+            undersized,
+            [],
+            f"{len(undersized)} List elements narrower than a tagged pointer",
         )
 
 
