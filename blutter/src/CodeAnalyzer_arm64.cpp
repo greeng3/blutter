@@ -3635,22 +3635,70 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 				// array
 				// The index is relative to where the payload starts, and that
 				// differs by array kind: an Array (List) has a type_arguments
-				// field ahead of its data, TypedData does not. Computing a List
-				// index off the TypedData base yields negative indices.
-				const int32_t payload_offset = arrayOp.arrType == ArrayOp::List
-					? (int32_t)(dart::Array::data_offset() - dart::kHeapObjectTag)
-					: (int32_t)(dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag);
-				const auto idx = VarStorage::NewSmallImm((offset - payload_offset) / arrayOp.size);
-				if (arrayOp.isLoad) {
-					return std::make_unique<LoadArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+				// field ahead of its data, TypedData does not, and a String's
+				// characters start before either. Computing an index off the
+				// wrong base yields a negative one, which no element access has.
+				const int32_t arrayPayload = (int32_t)(dart::Array::data_offset() - dart::kHeapObjectTag);
+				const int32_t typedPayload = (int32_t)(dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag);
+				// OneByteString and TwoByteString share it; the element size
+				// says which of the two this is.
+				const int32_t stringPayload = (int32_t)(dart::OneByteString::data_offset() - dart::kHeapObjectTag);
+
+				// TypedDataBase::data_ points at the payload itself, so a register
+				// loaded from that field is already at element zero.
+				bool objRegIsPayload = false;
+				if (!fnInfo->il_insns.empty() && fnInfo->LastIL()->Kind() == ILInstr::LoadField) {
+					const auto il_lf = reinterpret_cast<LoadFieldInstr*>(fnInfo->LastIL());
+					objRegIsPayload = il_lf->dstReg == objReg
+						&& il_lf->offset == (uint32_t)(dart::PointerBase::data_offset() - dart::kHeapObjectTag);
+				}
+
+				auto op = arrayOp;
+				int32_t payload_offset;
+				if (op.arrType == ArrayOp::List) {
+					payload_offset = arrayPayload;
+				}
+				else if (objRegIsPayload) {
+					payload_offset = 0;
+				}
+				else if (offset >= typedPayload) {
+					payload_offset = typedPayload;
+				}
+				else if (offset >= stringPayload && op.size <= 2) {
+					// Below the TypedData payload, so this cannot be indexing one:
+					// its element zero lives at typedPayload and an index never
+					// runs backwards. A character read is the access of this shape
+					// that reads from there.
+					payload_offset = stringPayload;
+					op.arrType = ArrayOp::String;
+				}
+				else if (offset < 0) {
+					// Not a Dart object access at all — no field or element of one
+					// lives before its header. FFI trampolines read their arguments
+					// this way. Leave the instruction as it is rather than describe
+					// it wrongly.
+					return nullptr;
+				}
+				else {
+					// Below every payload base, so nothing here says which array
+					// this indexes, if any. Report the read that is actually there
+					// rather than invent an element for it.
+					if (op.isLoad)
+						return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+					return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+				}
+
+				const auto idx = VarStorage::NewSmallImm((offset - payload_offset) / op.size);
+				if (op.isLoad) {
+					return std::make_unique<LoadArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 				}
 				else {
 					const auto il_wb = processWriteBarrierInstr(insn);
 					if (il_wb) {
-						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 					}
 					else {
-						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, arrayOp);
+						return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
 					}
 				}
 			}
