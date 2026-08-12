@@ -346,6 +346,14 @@ public:
 	std::unique_ptr<ILInstr> processLoadStore(AsmIterator& insn);
 	intptr_t guardedClassId(AsmIterator& insn, uint64_t accessAddr, A64::Register objReg);
 
+	// What an allocation stub put in a register, when the access reading it can
+	// only have been reached from that allocation.
+	enum class FreshAlloc { None, Array, GrowableArray };
+	FreshAlloc freshAllocation(AsmIterator& insn, uint64_t accessAddr, A64::Register objReg);
+	const std::unordered_set<uint64_t>& branchTargets();
+	std::unordered_set<uint64_t> branchTargetAddrs;
+	bool branchTargetsBuilt{ false };
+
 	struct ObjectPoolInstr {
 		// dstReg is srcReg when isWrite is true
 		A64::Register dstReg;
@@ -3471,6 +3479,114 @@ static ArrayOp getArrayOp(AsmIterator& insn, int32_t arr_data_offset)
 	return ArrayOp();
 }
 
+// An instruction whose first operand is a register it does not write. Reading one
+// of these over a register being followed says nothing about that register.
+static bool writesFirstOperand(const AsmIterator& i)
+{
+	switch (i.id()) {
+	case ARM64_INS_CMP: case ARM64_INS_CMN: case ARM64_INS_TST:
+	case ARM64_INS_STR: case ARM64_INS_STUR: case ARM64_INS_STRB: case ARM64_INS_STURB:
+	case ARM64_INS_STRH: case ARM64_INS_STURH: case ARM64_INS_STP:
+	case ARM64_INS_B: case ARM64_INS_BL: case ARM64_INS_BR: case ARM64_INS_BLR:
+	case ARM64_INS_CBZ: case ARM64_INS_CBNZ: case ARM64_INS_TBZ: case ARM64_INS_TBNZ:
+		return false;
+	}
+	return true;
+}
+
+// Every address in this function that some instruction in it branches to. An
+// access is only known to follow an allocation if nothing between the two can be
+// jumped to from anywhere else.
+const std::unordered_set<uint64_t>& FunctionAnalyzer::branchTargets()
+{
+	if (!branchTargetsBuilt) {
+		branchTargetsBuilt = true;
+		for (cs_insn* p = asm_insns.FirstPtr(); p <= asm_insns.LastPtr(); ++p) {
+			switch (p->id) {
+			case ARM64_INS_B: case ARM64_INS_CBZ: case ARM64_INS_CBNZ:
+			case ARM64_INS_TBZ: case ARM64_INS_TBNZ: {
+				const auto& detail = p->detail->arm64;
+				if (detail.op_count > 0) {
+					const auto& last = detail.operands[detail.op_count - 1];
+					if (last.type == ARM64_OP_IMM)
+						branchTargetAddrs.insert((uint64_t)last.imm);
+				}
+				break;
+			}
+			}
+		}
+	}
+	return branchTargetAddrs;
+}
+
+// What the allocation stubs put in a register, for an access that can only have
+// been reached from that allocation.
+//
+//     0xae430: r0 = AllocateArray()
+//     0xae43c: stur x16, [x0, #0x17]   ; element 0
+//     0xae444: stur x16, [x0, #0x1f]   ; element 1, and so on
+//
+// An offset comparison recognises only the first of those, and claims one for
+// GrowableObjectArray::data, which sits exactly where an Array's payload starts.
+// What allocated the register settles both.
+//
+// The walk back stops at the first call, since a call is what puts a value in the
+// result register and also what clobbers it: if that call is an allocation stub,
+// the register holds what it returned. Anything writing the register in between,
+// any branch, and any instruction that another branch in this function targets
+// all end the walk — reaching the access another way means the allocation did not
+// necessarily happen.
+FunctionAnalyzer::FreshAlloc FunctionAnalyzer::freshAllocation(AsmIterator& insn, uint64_t accessAddr, A64::Register objReg)
+{
+	// The result of a call, and so of an allocation stub, is always in R0.
+	if (objReg != A64::Register::R0)
+		return FreshAlloc::None;
+
+	const uint64_t firstAddr = asm_insns.FirstPtr()->address;
+	if (accessAddr <= firstAddr)
+		return FreshAlloc::None;
+
+	AsmIterator it(insn, accessAddr);
+	for (int step = 0; step < 256 && it.address() > firstAddr; ++step) {
+		--it;
+
+		if (it.id() == ARM64_INS_BL && it.ops(0).type == ARM64_OP_IMM) {
+			const auto fn = app.GetFunction((uint64_t)it.ops(0).imm);
+			if (fn == nullptr || !fn->IsStub())
+				return FreshAlloc::None;
+			switch (reinterpret_cast<DartStub*>(fn)->kind) {
+			case DartStub::AllocateArrayStub:
+				return FreshAlloc::Array;
+			case DartStub::AllocateGrowableArrayStub:
+				return FreshAlloc::GrowableArray;
+			}
+			return FreshAlloc::None;
+		}
+
+		// A branch passed on the way back is a way *out* of this run, not into it:
+		// had it been taken, the access would not have been reached. Only an
+		// instruction something jumps to, checked below, admits control that never
+		// ran the allocation. An indirect call or a return is a different matter —
+		// the first clobbers the result register and the second cannot be fallen
+		// through at all.
+		switch (it.id()) {
+		case ARM64_INS_BR: case ARM64_INS_BLR: case ARM64_INS_RET:
+			return FreshAlloc::None;
+		}
+
+		if (it.op_count() >= 1 && it.ops(0).type == ARM64_OP_REG
+			&& A64::Register{ it.ops(0).reg } == objReg && writesFirstOperand(it))
+		{
+			return FreshAlloc::None;
+		}
+
+		if (branchTargets().contains(it.address()))
+			return FreshAlloc::None;
+	}
+
+	return FreshAlloc::None;
+}
+
 // The class id the code has just proved an object to have, when the access at
 // accessAddr sits under a test of it. Dart guards a character read with the
 // class it expects:
@@ -3518,20 +3634,6 @@ intptr_t FunctionAnalyzer::guardedClassId(AsmIterator& insn, uint64_t accessAddr
 	bool tagged = false;
 	int frameSlot = 0;
 	bool wantSpill = false;
-	// An instruction whose first operand is a register it does not write. Reading
-	// one of these over the object register says nothing about the object.
-	const auto writesFirstOperand = [](const AsmIterator& i) {
-		switch (i.id()) {
-		case ARM64_INS_CMP: case ARM64_INS_CMN: case ARM64_INS_TST:
-		case ARM64_INS_STR: case ARM64_INS_STUR: case ARM64_INS_STRB: case ARM64_INS_STURB:
-		case ARM64_INS_STRH: case ARM64_INS_STURH: case ARM64_INS_STP:
-		case ARM64_INS_B: case ARM64_INS_BL: case ARM64_INS_BR: case ARM64_INS_BLR:
-		case ARM64_INS_CBZ: case ARM64_INS_CBNZ: case ARM64_INS_TBZ: case ARM64_INS_TBNZ:
-			return false;
-		}
-		return true;
-	};
-
 	for (int step = 0; step < 64 && it.address() > firstAddr; ++step) {
 		--it;
 
@@ -3778,6 +3880,38 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 			const auto offset = insn.ops(1).mem.disp;
 			const auto accessAddr = insn.address();
 			++insn;
+
+			// An allocation stub says what the register holds, where an offset
+			// cannot: only element zero of an Array sits at a distinguishable
+			// offset, and GrowableObjectArray::data sits at that very offset
+			// without being an element at all.
+			const auto fresh = freshAllocation(insn, accessAddr, objReg);
+			if (fresh == FreshAlloc::Array && arrayOp.arrType == ArrayOp::Unknown) {
+				const int32_t arrayPayload = (int32_t)(dart::Array::data_offset() - dart::kHeapObjectTag);
+				if (offset >= arrayPayload && (offset - arrayPayload) % arrayOp.size == 0) {
+					// The stub wrote this Array's type arguments and length itself,
+					// so everything the caller stores at a fixed offset is an
+					// element — element zero included, which the offset comparison
+					// already reached on its own.
+					auto op = arrayOp;
+					op.arrType = ArrayOp::List;
+					const auto idx = VarStorage::NewSmallImm((offset - arrayPayload) / op.size);
+					if (op.isLoad)
+						return std::make_unique<LoadArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
+					processWriteBarrierInstr(insn);
+					return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, idx, op);
+				}
+			}
+
+			if (fresh == FreshAlloc::GrowableArray) {
+				// A GrowableObjectArray has no elements of its own: its payload is
+				// the separate array its data field points at, so its own fixed
+				// offsets are fields however much one of them looks like a payload.
+				if (arrayOp.isLoad)
+					return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+				processWriteBarrierInstr(insn);
+				return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+			}
 
 			if (arrayOp.arrType == ArrayOp::Unknown) {
 				// might be array or object. set it as object first.
